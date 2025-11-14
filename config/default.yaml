@@ -8,6 +8,7 @@ paths:
   cache_dir: ./data/hf_cache
   save_path: ./data/best_model.pth
   metrics_path: ./data/training_metrics.csv
+  summary_path: ./data/training_summary.json
 
 train:
   batch_size: 8

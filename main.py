@@ -8,7 +8,7 @@ import yaml
 
 from src import data, models
 from src.train import train_model
-from src.utils import save_loss_plot
+from src.utils import save_loss_plot, save_training_summary
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -51,6 +51,9 @@ def main():
     metrics_path = cfg["paths"].get("metrics_path")
     if not metrics_path:
         metrics_path = os.path.join(output_dir, "training_metrics.csv")
+    summary_path = cfg["paths"].get("summary_path")
+    if not summary_path:
+        summary_path = os.path.join(output_dir, "training_summary.json")
 
     if mode == "download_data":
         data.download_data(dataset_name, output_dir=output_dir, cache_dir=cache_dir)
@@ -101,6 +104,7 @@ def main():
         end = time.time()
         training_time = end - start
         save_loss_plot(history, training_time, save_path="./data/loss_curve.png")
+        save_training_summary(history, training_time, save_path=summary_path)
 
     elif mode == "evaluate_model":
         # leer modelo y evaluar
