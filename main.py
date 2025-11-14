@@ -1,9 +1,10 @@
 import argparse
-import torch
-import yaml
+import os
 import time
 
 import matplotlib.pyplot as plt
+import torch
+import yaml
 
 from src import data, models
 from src.train import train_model
@@ -47,6 +48,9 @@ def main():
     model_name = cfg["model_name"]
     output_dir = cfg["paths"]["output_dir"]
     cache_dir = cfg["paths"]["cache_dir"]
+    metrics_path = cfg["paths"].get("metrics_path")
+    if not metrics_path:
+        metrics_path = os.path.join(output_dir, "training_metrics.csv")
 
     if mode == "download_data":
         data.download_data(dataset_name, output_dir=output_dir, cache_dir=cache_dir)
@@ -92,6 +96,7 @@ def main():
             patience=cfg["train"]["patience"],
             epochs=cfg["train"]["epochs"],
             save_path=cfg["paths"]["save_path"],
+            metrics_path=metrics_path,
         )
         end = time.time()
         training_time = end - start
