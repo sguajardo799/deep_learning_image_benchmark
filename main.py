@@ -19,6 +19,10 @@ def parse_arguments():
     parser.add_argument("--dataset_name")
     parser.add_argument("--model_name")
     parser.add_argument("--task")
+    parser.add_argument("--batch_size", type=int)
+    parser.add_argument("--learning_rate", type=float)
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--patience", type=int)
     return parser.parse_args()
 
 def load_config(path):
@@ -35,6 +39,14 @@ def merge_cli(cfg, args):
         cfg["model_name"] = args.model_name
     if args.task is not None:
         cfg["task"] = args.task
+    if args.batch_size is not None:
+        cfg["train"]["batch_size"] = args.batch_size
+    if args.learning_rate is not None:
+        cfg["train"]["lr"] = args.learning_rate
+    if args.epochs is not None:
+        cfg["train"]["epochs"] = args.epochs
+    if args.patience is not None:
+        cfg["train"]["patience"] = args.patience
     return cfg
 
 def main():
@@ -46,8 +58,8 @@ def main():
     task = cfg["task"]
     dataset_name = cfg["dataset_name"]
     model_name = cfg["model_name"]
-    output_dir = cfg["paths"]["output_dir"]
-    cache_dir = cfg["paths"]["cache_dir"]
+    output_dir = os.environ.get("OUTPUT_DIR", cfg["paths"]["output_dir"])
+    cache_dir = os.environ.get("CACHE_DIR", cfg["paths"]["cache_dir"])
     metrics_path = cfg["paths"].get("metrics_path")
     if not metrics_path:
         metrics_path = os.path.join(output_dir, "training_metrics.csv")
@@ -61,6 +73,11 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    data_cfg = cfg.get("data", {})
+    img_size = data_cfg.get("img_size")
+    if img_size is None:
+        img_size = 224 if task == "classification" else None
+
     if mode == "train_model":
         train_loader, num_classes = data.load_data(
             dataset_name=dataset_name,
@@ -68,6 +85,8 @@ def main():
             output_dir=output_dir,
             cache_dir=cache_dir,
             batch_size=cfg["train"]["batch_size"],
+            img_size=img_size,
+            task=task,
         )
         val_loader, _ = data.load_data(
             dataset_name=dataset_name,
@@ -75,6 +94,8 @@ def main():
             output_dir=output_dir,
             cache_dir=cache_dir,
             batch_size=cfg["train"]["batch_size"],
+            img_size=img_size,
+            task=task,
         )
 
         model = models.create_model(

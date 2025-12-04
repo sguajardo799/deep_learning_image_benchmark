@@ -1,2 +1,6 @@
 datasets
 huggingface_hub
+matplotlib
+torch
+torchvision
+pyyaml

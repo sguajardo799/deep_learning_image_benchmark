@@ -5,9 +5,10 @@
 + Correr contenedor con volumen para datasets 
 ``` 
 mkdir -p ./data
-docker run --rm -v $(pwd)/data:/app/data [TAG] --mode download_data
+docker run --rm -v $(pwd)/data:/app/data [TAG] --mode download_data --dataset_name [DATASET_NAME]
 ```
 + Entrenar modelo seleccionado en ``` config/default.yaml ```
 ```
 docker run --rm -v $(pwd)/data:/app/data -v $(pwd)/config/default.yaml:/app/config/default.yaml:ro [TAG] --mode train_model  
 ```
+

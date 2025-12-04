@@ -239,7 +239,9 @@ class DetectionRunner(BaseRunner):
         return {"loss": avg_loss}
 
     def evaluate_one_epoch(self, loader):
-        self.model.eval()
+        # Torchvision detection models return losses only in train mode.
+        # We use no_grad to prevent gradient tracking.
+        self.model.train()
         total_loss = 0.0
         num_batches = 0
 

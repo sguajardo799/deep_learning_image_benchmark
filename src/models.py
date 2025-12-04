@@ -1,12 +1,15 @@
+from typing import Any, Dict
+
 import torch.nn as nn
 from torchvision.models import resnet18, vit_b_16
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, ssd300_vgg16
 
 def create_model(task: str, model_name: str, num_classes: int, **kwargs):
     task = task.lower()
     if task == "classification":
         return create_classification_model(model_name, num_classes)
     elif task == "detection":
-        raise ValueError("[EN DESARROLLO]")
+        return create_detection_model(model_name, num_classes, **kwargs)
     else:
         raise ValueError(f"tarea no soportada: {task}")
     
@@ -21,3 +24,32 @@ def create_classification_model(model_name:str, num_classes:int):
         return model
     else:
         raise ValueError(f"modelo no soportado: {model_name}")
+
+def create_detection_model(
+    model_name: str,
+    num_classes: int,
+    *,
+    model_kwargs: Dict[str, Any] | None = None,
+):
+    model_name = model_name.lower()
+    extra_args = model_kwargs or {}
+
+    if model_name in {"faster_rcnn", "fasterrcnn_resnet50_fpn"}:
+        return fasterrcnn_resnet50_fpn(
+            weights=None,
+            num_classes=num_classes,
+            **extra_args,
+        )
+    elif model_name in {"ssd", "ssd300_vgg16"}:
+        return ssd300_vgg16(
+            weights=None,
+            num_classes=num_classes,
+            **extra_args,
+        )
+    elif model_name.startswith("yolo"):
+        raise NotImplementedError(
+            "La integración con modelos YOLO (Ultralytics) está planificada "
+            "pero aún no se encuentra disponible."
+        )
+    else:
+        raise ValueError(f"modelo de detección no soportado: {model_name}")
