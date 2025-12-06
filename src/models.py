@@ -2,7 +2,7 @@ from typing import Any, Dict
 
 import torch.nn as nn
 from torchvision.models import resnet18, vit_b_16
-from torchvision.models.detection import fasterrcnn_resnet50_fpn, ssd300_vgg16
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, ssd300_vgg16, detr_resnet50
 
 def create_model(task: str, model_name: str, num_classes: int, **kwargs):
     task = task.lower()
@@ -42,6 +42,12 @@ def create_detection_model(
         )
     elif model_name in {"ssd", "ssd300_vgg16"}:
         return ssd300_vgg16(
+            weights=None,
+            num_classes=num_classes,
+            **extra_args,
+        )
+    elif model_name in {"detr", "detr_resnet50"}:
+        return detr_resnet50(
             weights=None,
             num_classes=num_classes,
             **extra_args,
