@@ -58,14 +58,8 @@ def create_detection_model(
         except ImportError:
             import torch
             print("DETR not found in torchvision, loading from torch.hub...")
-            # Load model from hub
-            model = torch.hub.load(
-                'facebookresearch/detr:main',
-                'detr_resnet50',
-                pretrained=False,
-                num_classes=num_classes,
-            )
-            return DetrWrapper(model, num_classes)
+            # Load model from hub manually to avoid pretrained weights warning
+            return load_detr_model(num_classes, **extra_args)
 
     elif model_name.startswith("yolo"):
         raise NotImplementedError(
@@ -185,3 +179,70 @@ class DetrWrapper(nn.Module):
             new_t["boxes"] = new_boxes
             new_targets.append(new_t)
         return new_targets
+
+
+def load_detr_model(num_classes, **kwargs):
+    import torch
+    import sys
+    import os
+    import glob
+    import torchvision
+    
+    # 1. Ensure repo is downloaded
+    try:
+        torch.hub.list('facebookresearch/detr:main')
+    except Exception as e:
+        print(f"Warning: Failed to list/download DETR repo: {e}")
+
+    # 2. Setup path
+    hub_dir = torch.hub.get_dir()
+    repo_dirs = glob.glob(os.path.join(hub_dir, 'facebookresearch_detr_*'))
+    if not repo_dirs:
+        raise RuntimeError("DETR repo not found in torch hub cache. Ensure internet access or pre-download.")
+    
+    repo_dir = repo_dirs[0]
+    if repo_dir not in sys.path:
+        sys.path.insert(0, repo_dir)
+
+    # 3. Import modules
+    from models.backbone import BackboneBase, Joiner, FrozenBatchNorm2d
+    from models.position_encoding import PositionEmbeddingSine
+    from models.transformer import Transformer
+    from models.detr import DETR
+    
+    # 4. Define Patched Backbone
+    class NoPretrainBackbone(BackboneBase):
+        def __init__(self, name, train_backbone, return_interm_layers, dilation):
+            # Explicitly use weights=None to avoid warning and download
+            backbone = getattr(torchvision.models, name)(
+                replace_stride_with_dilation=[False, False, dilation],
+                weights=None, 
+                norm_layer=FrozenBatchNorm2d)
+            num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
+            super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
+
+    # 5. Build Model Components (replicating _make_detr logic)
+    # Defaults from hubconf.py
+    backbone_name = "resnet50"
+    dilation = False
+    mask = False
+    hidden_dim = 256
+    
+    # Create Backbone
+    backbone = NoPretrainBackbone(backbone_name, train_backbone=True, return_interm_layers=mask, dilation=dilation)
+    
+    # Create Position Embedding
+    pos_enc = PositionEmbeddingSine(hidden_dim // 2, normalize=True)
+    
+    # Join
+    backbone_with_pos_enc = Joiner(backbone, pos_enc)
+    backbone_with_pos_enc.num_channels = backbone.num_channels
+    
+    # Create Transformer
+    transformer = Transformer(d_model=hidden_dim, return_intermediate_dec=True)
+    
+    # Create DETR
+    model = DETR(backbone_with_pos_enc, transformer, num_classes=num_classes, num_queries=100)
+    
+    # 6. Wrap
+    return DetrWrapper(model, num_classes)
