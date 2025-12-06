@@ -41,7 +41,9 @@ def verify_detr():
         with torch.no_grad():
             detections = model(images)
             if isinstance(detections, list) and len(detections) == 2 and "boxes" in detections[0]:
-                print("✅ Inference forward pass successful.")
+                print("✅ Inference forward pass successful (List format).")
+            elif isinstance(detections, dict) and "pred_logits" in detections:
+                print("✅ Inference forward pass successful (Dict format - DETR).")
             else:
                 print(f"❌ Inference forward pass returned unexpected output: {type(detections)}")
     except Exception as e:
