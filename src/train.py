@@ -227,7 +227,14 @@ class DetectionRunner(BaseRunner):
         for batch in loader:
             self.optimizer.zero_grad()
             images, targets = _move_detection_batch(batch, self.device)
-            loss_dict = self.model(images, targets)
+            try:
+                loss_dict = self.model(images, targets)
+            except AssertionError as e:
+                print("Caught AssertionError during training step!")
+                print(f"Batch size: {len(images)}")
+                print(f"Image shapes: {[img.shape for img in images]}")
+                print(f"Targets: {targets}")
+                raise e
             loss = sum(loss_dict.values())
             loss.backward()
             self.optimizer.step()

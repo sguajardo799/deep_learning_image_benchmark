@@ -1,5 +1,6 @@
 from typing import Any, Dict
 
+import torch
 import torch.nn as nn
 from torchvision.models import resnet18, vit_b_16
 from torchvision.models.detection import fasterrcnn_resnet50_fpn, ssd300_vgg16
@@ -142,6 +143,24 @@ class DetrWrapper(nn.Module):
             
             # Convert targets to DETR format (cx, cy, w, h) normalized
             detr_targets = self._convert_targets(targets, images)
+
+            # --- DEBUG START ---
+            # Check for NaNs in outputs
+            if torch.isnan(outputs['pred_logits']).any() or torch.isnan(outputs['pred_boxes']).any():
+                print("WARNING: NaNs detected in model outputs!")
+                print(f"Logits range: {outputs['pred_logits'].min()} to {outputs['pred_logits'].max()}")
+                print(f"Boxes range: {outputs['pred_boxes'].min()} to {outputs['pred_boxes'].max()}")
+            
+            # Check for invalid targets
+            for i, t in enumerate(detr_targets):
+                boxes = t['boxes']
+                if (boxes[:, 2:] < 0).any(): # Width or height < 0
+                    print(f"WARNING: Negative width/height in target {i}")
+                    print(boxes)
+                if torch.isnan(boxes).any():
+                    print(f"WARNING: NaNs in target {i}")
+                    print(boxes)
+            # --- DEBUG END ---
             
             # Calculate loss
             loss_dict = self.criterion(outputs, detr_targets)
