@@ -53,6 +53,8 @@ def main():
 
     model.eval()
     
+    input_shapes = {}
+    
     # 2. Prepare Dummy Input
     if args.task == "classification":
         # Standard image input: [B, 3, 224, 224]
@@ -60,6 +62,14 @@ def main():
         input_names = ['input']
         output_names = ['output']
         dynamic_axes = {'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}}
+        
+        # Define shapes for TensorRT Optimization Profile
+        # Min: Batch 1, Opt: args.batch_size, Max: args.batch_size
+        input_shapes['input'] = (
+            (1, 3, 224, 224),
+            (args.batch_size, 3, 224, 224),
+            (args.batch_size, 3, 224, 224)
+        )
         
     elif args.task == "detection":
         # DETR expects list of tensors, but ONNX export usually requires a single tensor or tuple
@@ -109,6 +119,12 @@ def main():
              input_names = ['input']
              output_names = ['boxes', 'scores', 'labels']
              dynamic_axes = {'input': {0: 'batch_size'}}
+             
+             input_shapes['input'] = (
+                (1, 3, 300, 300),
+                (args.batch_size, 3, 300, 300),
+                (args.batch_size, 3, 300, 300)
+             )
 
     # 3. Export to ONNX
     onnx_filename = f"{args.model}_{args.task}.onnx"
@@ -135,7 +151,7 @@ def main():
     # 5. Build TensorRT Engine
     engine_filename = f"{args.model}_{args.task}.engine"
     engine_path = os.path.join(args.output_dir, engine_filename)
-    build_tensorrt_engine(onnx_path, engine_path, fp16=args.fp16)
+    build_tensorrt_engine(onnx_path, engine_path, fp16=args.fp16, input_shapes=input_shapes)
 
     print("\n------------------------------------------------")
     print(f"Processing complete for {args.model}")

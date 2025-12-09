@@ -74,9 +74,16 @@ def quantize_onnx_model(onnx_path, quantized_path):
         logger.error(f"❌ ONNX quantization failed: {e}")
         raise e
 
-def build_tensorrt_engine(onnx_path, engine_path, fp16=True):
+def build_tensorrt_engine(onnx_path, engine_path, fp16=True, input_shapes=None):
     """
     Builds a TensorRT engine from an ONNX file.
+    
+    Args:
+        onnx_path: Path to ONNX model.
+        engine_path: Path to save TensorRT engine.
+        fp16: Enable FP16 precision.
+        input_shapes: Dict mapping input names to (min_shape, opt_shape, max_shape) tuples.
+                      Example: {'input': ((1, 3, 224, 224), (8, 3, 224, 224), (8, 3, 224, 224))}
     """
     try:
         import tensorrt as trt
@@ -99,6 +106,15 @@ def build_tensorrt_engine(onnx_path, engine_path, fp16=True):
         if fp16 and builder.platform_has_fast_fp16:
             config.set_flag(trt.BuilderFlag.FP16)
             logger.info("Enabled FP16 precision.")
+
+        # Create Optimization Profile if input_shapes provided
+        if input_shapes:
+            profile = builder.create_optimization_profile()
+            for name, (min_shape, opt_shape, max_shape) in input_shapes.items():
+                logger.info(f"Adding optimization profile for {name}: min={min_shape}, opt={opt_shape}, max={max_shape}")
+                profile.set_shape(name, min_shape, opt_shape, max_shape)
+            config.add_optimization_profile(profile)
+            
             
         # Parse ONNX
         if not parser.parse_from_file(onnx_path):
