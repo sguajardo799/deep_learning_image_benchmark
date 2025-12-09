@@ -71,6 +71,10 @@ def main():
             (args.batch_size, 3, 224, 224)
         )
         
+        if args.model == "vit_16":
+            print("Warning: Disabling dynamic axes for ViT to avoid shape inference issues.")
+            dynamic_axes = None
+            
     elif args.task == "detection":
         # DETR expects list of tensors, but ONNX export usually requires a single tensor or tuple
         # For DETR export, we usually export the model that takes a NestedTensor or just the tensor if modified

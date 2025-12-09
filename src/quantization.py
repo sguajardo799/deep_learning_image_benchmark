@@ -28,7 +28,7 @@ def export_to_onnx(model, dummy_input, onnx_path, input_names=['input'], output_
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
-            opset_version=17 
+            opset_version=14
         )
         logger.info("✅ ONNX export successful.")
         
@@ -53,20 +53,34 @@ def quantize_onnx_model(onnx_path, quantized_path):
         
         # Pre-process the model to improve shape inference
         preprocessed_path = onnx_path.replace(".onnx", "_preprocessed.onnx")
+        use_preprocessed = False
         try:
             quant_pre_process(onnx_path, preprocessed_path)
             logger.info("✅ ONNX pre-processing successful.")
-            input_model_path = preprocessed_path
+            use_preprocessed = True
         except Exception as e:
             logger.warning(f"⚠️ ONNX pre-processing failed: {e}. Proceeding with original model.")
-            input_model_path = onnx_path
 
+        # Try quantizing preprocessed model first if available
+        if use_preprocessed:
+            try:
+                quantize_dynamic(
+                    preprocessed_path,
+                    quantized_path,
+                    weight_type=QuantType.QUInt8
+                )
+                logger.info("✅ ONNX quantization successful (using preprocessed model).")
+                return
+            except Exception as e:
+                logger.warning(f"⚠️ Quantization of preprocessed model failed: {e}. Retrying with original model...")
+        
+        # Fallback to original model
         quantize_dynamic(
-            input_model_path,
+            onnx_path,
             quantized_path,
             weight_type=QuantType.QUInt8
         )
-        logger.info("✅ ONNX quantization successful.")
+        logger.info("✅ ONNX quantization successful (using original model).")
         
     except ImportError:
         logger.error("❌ onnxruntime is not installed. Please install it to use quantization.")
