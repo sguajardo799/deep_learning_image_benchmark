@@ -101,12 +101,11 @@ def build_tensorrt_engine(onnx_path, engine_path, fp16=True):
             logger.info("Enabled FP16 precision.")
             
         # Parse ONNX
-        with open(onnx_path, 'rb') as model:
-            if not parser.parse(model.read()):
-                logger.error("❌ Failed to parse ONNX file.")
-                for error in range(parser.num_errors):
-                    logger.error(parser.get_error(error))
-                return None
+        if not parser.parse_from_file(onnx_path):
+            logger.error("❌ Failed to parse ONNX file.")
+            for error in range(parser.num_errors):
+                logger.error(parser.get_error(error))
+            return None
         
         # Build engine
         serialized_engine = builder.build_serialized_network(network, config)
