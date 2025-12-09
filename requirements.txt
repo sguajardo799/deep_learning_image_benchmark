@@ -2,3 +2,6 @@ datasets
 huggingface_hub
 matplotlib
 pyyaml
+onnx
+onnxscript
+onnxruntime-gpu
