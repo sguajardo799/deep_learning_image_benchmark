@@ -75,6 +75,9 @@ def _build_classification_dataloader(ds, batch_size, split, img_size):
     ])
     transform = T.Compose(transforms_list)
 
+    if "img" in features and "image" not in features:
+        ds = ds.rename_column("img", "image")
+
     def apply_transforms(examples):
         examples["image"] = [transform(img.convert("RGB")) for img in examples["image"]]
         return examples
