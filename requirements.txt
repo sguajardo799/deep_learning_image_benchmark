@@ -5,3 +5,4 @@ pyyaml
 onnx
 onnxscript
 onnxruntime-gpu
+pycuda
