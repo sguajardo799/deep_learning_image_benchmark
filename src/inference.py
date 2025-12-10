@@ -58,13 +58,20 @@ class OnnxSession(InferenceSession):
         if isinstance(inputs, torch.Tensor):
             inputs = inputs.cpu().numpy()
             ort_inputs = {self.input_names[0]: inputs}
+        elif isinstance(inputs, np.ndarray):
+             ort_inputs = {self.input_names[0]: inputs}
+        elif isinstance(inputs, dict):
+             ort_inputs = {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         elif isinstance(inputs, (list, tuple)):
              # Assuming single input for ONNX usually, or map by index
              # If multiple inputs, we need to know mapping. 
              # For now, simplistic assumption: first input matches first arg
-             ort_inputs = {self.input_names[0]: inputs[0].cpu().numpy()}
+             val = inputs[0]
+             if isinstance(val, torch.Tensor):
+                 val = val.cpu().numpy()
+             ort_inputs = {self.input_names[0]: val}
         else:
-            raise ValueError("Unsupported input type for ONNX session")
+            raise ValueError(f"Unsupported input type for ONNX session: {type(inputs)}")
             
         return self.session.run(None, ort_inputs)
 
@@ -91,17 +98,29 @@ class TensorRTSession(InferenceSession):
             self.bindings = []
             self.stream = cuda.Stream()
             
-            for binding in self.engine:
-                size = trt.volume(self.engine.get_binding_shape(binding)) * self.engine.max_batch_size
-                dtype = trt.nptype(self.engine.get_binding_dtype(binding))
+            for i in range(self.engine.num_io_tensors):
+                tensor_name = self.engine.get_tensor_name(i)
+                shape = self.engine.get_tensor_shape(tensor_name)
+                # Handle dynamic shapes if necessary (using max profile) - simplistic approach here:
+                # If shape has -1, we might need to set it. For now assuming static or handled.
+                
+                size = trt.volume(shape) * self.engine.max_batch_size
+                dtype = trt.nptype(self.engine.get_tensor_dtype(tensor_name))
+                
                 # Allocate host and device buffers
                 host_mem = cuda.pagelocked_empty(size, dtype)
                 device_mem = cuda.mem_alloc(host_mem.nbytes)
+                
+                # Append to bindings list (legacy) or address map (v3)
+                # For execute_async_v2 we usually pass a list of pointers.
+                # However, bindings order must match engine binding indices.
+                # Since we iterate by index, this should be correct.
                 self.bindings.append(int(device_mem))
-                if self.engine.binding_is_input(binding):
-                    self.inputs.append({'host': host_mem, 'device': device_mem})
+                
+                if self.engine.get_tensor_mode(tensor_name) == trt.TensorIOMode.INPUT:
+                    self.inputs.append({'host': host_mem, 'device': device_mem, 'name': tensor_name})
                 else:
-                    self.outputs.append({'host': host_mem, 'device': device_mem})
+                    self.outputs.append({'host': host_mem, 'device': device_mem, 'name': tensor_name})
                     
         except ImportError:
             raise ImportError("tensorrt or pycuda is not installed.")
