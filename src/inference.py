@@ -63,12 +63,14 @@ class OnnxSession(InferenceSession):
         elif isinstance(inputs, dict):
              ort_inputs = {k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         elif isinstance(inputs, (list, tuple)):
-             # Assuming single input for ONNX usually, or map by index
-             # If multiple inputs, we need to know mapping. 
-             # For now, simplistic assumption: first input matches first arg
-             val = inputs[0]
-             if isinstance(val, torch.Tensor):
-                 val = val.cpu().numpy()
+             # Detection dataloader often yields list[Tensor(C,H,W)].
+             # For ONNX we need a single batched tensor [B,C,H,W].
+             if len(inputs) == 0:
+                 raise ValueError("Empty input list/tuple for ONNX session.")
+             if isinstance(inputs[0], torch.Tensor):
+                 val = torch.stack(list(inputs), dim=0).cpu().numpy()
+             else:
+                 val = np.stack(list(inputs), axis=0)
              ort_inputs = {self.input_names[0]: val}
         else:
             raise ValueError(f"Unsupported input type for ONNX session: {type(inputs)}")
@@ -129,10 +131,16 @@ class TensorRTSession(InferenceSession):
         # Copy input data to host buffer
         # Simplistic assumption: single input
         if isinstance(inputs, torch.Tensor):
-            np.copyto(self.inputs[0]['host'], inputs.cpu().numpy().ravel())
+            batched = inputs
+        elif isinstance(inputs, (list, tuple)):
+            if len(inputs) == 0:
+                raise ValueError("Empty input list/tuple for TensorRT session.")
+            # stack list[Tensor(C,H,W)] -> [B,C,H,W]
+            batched = torch.stack(list(inputs), dim=0)
         else:
-             # Handle list/tuple
-             np.copyto(self.inputs[0]['host'], inputs[0].cpu().numpy().ravel())
+            raise ValueError(f"Unsupported input type for TensorRT session: {type(inputs)}")
+
+        np.copyto(self.inputs[0]['host'], batched.cpu().numpy().ravel())
 
         # Transfer input data to the GPU.
         for inp in self.inputs:

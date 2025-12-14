@@ -172,12 +172,14 @@ class DetectionDataset(Dataset):
         label_key: str,
         label_mapping: Optional[Dict[str, int]] = None,
         img_size: Optional[int] = None,
+        label_offset: int = 0,
     ):
         self.dataset = hf_dataset
         self.label_key = label_key
         self.label_mapping = label_mapping or {}
         self.to_tensor = T.ToTensor()
         self.resize = T.Resize((img_size, img_size)) if img_size else None
+        self.label_offset = int(label_offset)
 
     def __len__(self):
         return len(self.dataset)
@@ -219,11 +221,41 @@ class DetectionDataset(Dataset):
             if not bbox or len(bbox) != 4:
                 continue
 
-            x, y, w, h = bbox
-            x1 = x * scale_x
-            y1 = y * scale_y
-            x2 = (x + w) * scale_x
-            y2 = (y + h) * scale_y
+            a, b, c, d = bbox
+
+            # Detect bbox format:
+            # - COCO classic: [x, y, w, h]
+            # - Some HF variants: [x1, y1, x2, y2]
+            is_xyxy = (c > a) and (d > b) and (c <= orig_w) and (d <= orig_h)
+
+            if is_xyxy:
+                x1, y1, x2, y2 = float(a), float(b), float(c), float(d)
+            else:
+                x, y, w, h = float(a), float(b), float(c), float(d)
+                x1, y1 = x, y
+                x2, y2 = x + w, y + h
+
+            # Apply resize scaling if used
+            x1 *= scale_x
+            x2 *= scale_x
+            y1 *= scale_y
+            y2 *= scale_y
+
+            # Clamp to image bounds (after resize)
+            if self.resize:
+                bound_w, bound_h = new_w, new_h
+            else:
+                bound_w, bound_h = orig_w, orig_h
+
+            x1 = max(0.0, min(x1, bound_w - 1.0))
+            x2 = max(0.0, min(x2, bound_w - 1.0))
+            y1 = max(0.0, min(y1, bound_h - 1.0))
+            y2 = max(0.0, min(y2, bound_h - 1.0))
+
+            # Filter degenerate boxes
+            if x2 <= x1 or y2 <= y1:
+                continue
+
             boxes.append([x1, y1, x2, y2])
 
             label_value = raw_labels[box_idx] if box_idx < len(raw_labels) else 0
@@ -262,7 +294,7 @@ class DetectionDataset(Dataset):
             if label in self.label_mapping:
                 return self.label_mapping[label]
             raise KeyError(f"Etiqueta '{label}' no está mapeada en label_mapping.")
-        return int(label)
+        return int(label) + self.label_offset
 
 
 def _detection_collate_fn(batch):
