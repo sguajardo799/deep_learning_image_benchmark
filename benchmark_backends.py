@@ -67,13 +67,25 @@ def load_checkpoint_flexible(model: torch.nn.Module, ckpt_path: str) -> None:
     if unexpected:
         print(f"[WARN] Unexpected keys (showing up to 20): {unexpected[:20]}  (total={len(unexpected)})")
 
-def make_loader(dataset_name: str, split: str, batch_size: int, num_workers: int):
+def make_loader(dataset_name: str, split: str, batch_size: int, num_workers: int,
+                num_samples: int = 0, streaming: bool = False, cache_dir: str = ""):
+    """
+    Builds a DataLoader for a HuggingFace dataset.
+
+    num_samples:
+      - 0 means "use full split"
+      - >0 limits to the first N samples (useful to avoid long downloads / quick benchmarks)
+
+    streaming:
+      - If True, uses HF streaming mode (doesn't materialize the whole dataset locally).
+        Great for quick benchmarks; you'll still download the samples you iterate.
+
+    cache_dir:
+      - Optional HF datasets cache directory.
+    """
     from datasets import load_dataset
     import torchvision.transforms as T
-    from torch.utils.data import DataLoader
-
-    ds_dict = load_dataset(dataset_name)
-    ds = ds_dict[split]
+    from torch.utils.data import DataLoader, IterableDataset
 
     transform = T.Compose([
         T.Resize(256),
@@ -82,6 +94,38 @@ def make_loader(dataset_name: str, split: str, batch_size: int, num_workers: int
         T.Normalize(mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225]),
     ])
+
+    if streaming:
+        hf_it = load_dataset(dataset_name, split=split, streaming=True,
+                             cache_dir=cache_dir if cache_dir else None)
+
+        class WrappedIter(IterableDataset):
+            def __iter__(self):
+                n = 0
+                for ex in hf_it:
+                    img = ex["image"].convert("RGB")
+                    x = transform(img)
+                    y = ex["label"]
+                    yield {"image": x, "label": y}
+                    n += 1
+                    if num_samples and n >= num_samples:
+                        break
+
+        ds = WrappedIter()
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            num_workers=0,        # streaming: keep simple; workers may duplicate streams
+            pin_memory=True,
+        )
+        return loader
+
+    ds_dict = load_dataset(dataset_name, cache_dir=cache_dir if cache_dir else None)
+    ds = ds_dict[split]
+
+    if num_samples and num_samples > 0:
+        num_samples = min(num_samples, len(ds))
+        ds = ds.select(range(num_samples))
 
     def apply_transforms(examples):
         examples["image"] = [transform(img.convert("RGB")) for img in examples["image"]]
@@ -407,6 +451,9 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--dataset", default="timm/mini-imagenet")
     ap.add_argument("--split", default="validation")
+    ap.add_argument("--num-samples", type=int, default=0, help="If >0, only use the first N samples of the split.")
+    ap.add_argument("--streaming", action="store_true", help="Use HuggingFace streaming mode to avoid full downloads.")
+    ap.add_argument("--hf-cache-dir", default="", help="Optional HuggingFace datasets cache dir.")
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--warmup-batches", type=int, default=10)
@@ -416,7 +463,10 @@ def main():
     args = ap.parse_args()
 
     max_batches = int(args.max_batches) if args.max_batches is not None else None
-    loader = make_loader(args.dataset, args.split, args.batch_size, args.num_workers)
+    loader = make_loader(args.dataset, args.split, args.batch_size, args.num_workers,
+                         num_samples=args.num_samples,
+                         streaming=args.streaming,
+                         cache_dir=args.hf_cache_dir)
 
     # ----- Torch -----
     model = build_model(args.model, args.num_classes)
