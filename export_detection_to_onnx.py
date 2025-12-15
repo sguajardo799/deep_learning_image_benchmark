@@ -1,62 +1,67 @@
 #!/usr/bin/env python3
 """
-export_detection_to_onnx.py
+export_detection_to_onnx_v2.py
 
-Export Torch detection models (SSD / DETR) to ONNX.
+Fixes for torchvision SSD export:
+- Avoids downloading VGG16 backbone weights by setting weights_backbone=None.
+- Adds --auto-num-classes to infer SSD num_classes from checkpoint head shapes.
+  (torchvision SSD "num_classes" INCLUDES background).
 
-Supports:
-- SSD (torchvision):  ssd300_vgg16, ssdlite320_mobilenet_v3_large
-  * ONNX wrapper pads detections to fixed --max-dets and returns:
-      boxes:  [B, max_dets, 4]  (xyxy, in pixels)
-      scores: [B, max_dets]
-      labels: [B, max_dets]     (int64)
-- DETR:
-  * torch.hub facebookresearch/detr: detr_resnet50 / detr_resnet101
-  * or torchvision.models.detection.detr_resnet50 (if available in your torchvision)
-  * ONNX outputs:
-      pred_logits: [B, num_queries, num_classes+1]
-      pred_boxes:  [B, num_queries, 4]  (cxcywh normalized)
+Why you hit mismatch:
+- Your checkpoint head conv out_channels are multiples of anchors_per_loc.
+  Example first head has out=324 and anchors=4 -> num_classes=324/4=81.
+  You passed 91, so current model expects out=4*91=364.
 
-Checkpoint loading:
-- If you trained the model, pass --checkpoint; it will try common keys:
-  model_state_dict / state_dict / raw state_dict.
+Outputs:
+- SSD: boxes [B,K,4], scores [B,K], labels [B,K] (padded to --max-dets)
+- DETR: pred_logits [B,Q,C+1], pred_boxes [B,Q,4] (cxcywh normalized)
 
-No class mapping: we don't map labels.
+Examples:
 
-Example (DETR):
-  python export_detection_to_onnx.py \
-    --arch detr_resnet50 --source hub \
-    --checkpoint /app/checkpoints/detr.pth \
-    --num-classes 91 \
-    --img-size 800 800 \
-    --out /app/checkpoints/detr.onnx
+SSD (auto classes):
+  python export_detection_to_onnx_v2.py \
+    --arch ssd300_vgg16 --checkpoint /app/checkpoints/best_model.pth \
+    --auto-num-classes \
+    --img-size 300 300 --max-dets 100 --dynamic-batch \
+    --out /app/checkpoints/ssd_fp32.onnx
 
-Example (SSD):
-  python export_detection_to_onnx.py \
-    --arch ssd300_vgg16 --source torchvision \
-    --checkpoint /app/checkpoints/ssd.pth \
-    --num-classes 91 \
-    --img-size 300 300 \
-    --max-dets 100 \
-    --out /app/checkpoints/ssd300.onnx
+SSD (explicit classes, includes background):
+  python export_detection_to_onnx_v2.py \
+    --arch ssd300_vgg16 --checkpoint /app/checkpoints/best_model.pth \
+    --num-classes 81 \
+    --img-size 300 300 --max-dets 100 --dynamic-batch \
+    --out /app/checkpoints/ssd_fp32.onnx
 """
 
 from __future__ import annotations
 import argparse
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, Tuple, Optional
 
 import torch
 
 
-def load_checkpoint_flexible(model: torch.nn.Module, ckpt_path: str) -> None:
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+SSD_ANCHORS_PER_LOC = (4, 6, 6, 6, 4, 4)  # torchvision ssd300_vgg16 / ssdlite320 heads
+
+
+def _extract_state_dict(ckpt: object) -> Dict[str, torch.Tensor]:
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        sd = ckpt["model_state_dict"]
-    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
-        sd = ckpt["state_dict"]
-    else:
-        sd = ckpt
+        return ckpt["model_state_dict"]
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        return ckpt["state_dict"]
+    if isinstance(ckpt, dict):
+        # could already be a state_dict-like mapping
+        # (still accept it)
+        return ckpt  # type: ignore[return-value]
+    raise TypeError(f"Unsupported checkpoint type: {type(ckpt)}")
+
+
+def load_checkpoint_flexible(model: torch.nn.Module, ckpt_path: str, *, strict_shapes: bool = True) -> Tuple[int, int]:
+    """
+    Returns (missing_count, unexpected_count). If strict_shapes=False, drops mismatched-shape tensors.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = _extract_state_dict(ckpt)
 
     cleaned = OrderedDict()
     for k, v in sd.items():
@@ -66,11 +71,70 @@ def load_checkpoint_flexible(model: torch.nn.Module, ckpt_path: str) -> None:
                 nk = nk[len(prefix):]
         cleaned[nk] = v
 
-    missing, unexpected = model.load_state_dict(cleaned, strict=False)
-    if missing:
-        print(f"[WARN] Missing keys (up to 20): {missing[:20]} (total={len(missing)})")
-    if unexpected:
-        print(f"[WARN] Unexpected keys (up to 20): {unexpected[:20]} (total={len(unexpected)})")
+    if strict_shapes:
+        missing, unexpected = model.load_state_dict(cleaned, strict=False)
+        return len(missing), len(unexpected)
+
+    # drop mismatched shapes
+    model_sd = model.state_dict()
+    filtered = OrderedDict()
+    dropped = 0
+    for k, v in cleaned.items():
+        if k in model_sd and model_sd[k].shape == v.shape:
+            filtered[k] = v
+        else:
+            dropped += 1
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    if dropped:
+        print(f"[WARN] Dropped {dropped} tensors due to shape mismatch (strict_shapes=False).")
+    return len(missing), len(unexpected)
+
+
+def infer_ssd_num_classes_from_ckpt(ckpt_path: str) -> Optional[int]:
+    """
+    Infer torchvision SSD num_classes (includes background) from classification head conv0 out_channels.
+    Uses anchors_per_loc[0]=4 for module_list.0.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = _extract_state_dict(ckpt)
+
+    # normalize prefixes like in loader
+    keys = list(sd.keys())
+    def norm(k: str) -> str:
+        for prefix in ("module.", "model.", "net."):
+            if k.startswith(prefix):
+                return k[len(prefix):]
+        return k
+
+    # find a likely key
+    want = "head.classification_head.module_list.0.weight"
+    for k in keys:
+        if norm(k) == want:
+            w = sd[k]
+            out_ch = int(w.shape[0])
+            a0 = SSD_ANCHORS_PER_LOC[0]
+            if out_ch % a0 != 0:
+                return None
+            return out_ch // a0
+
+    # fallback: try any module_list.*.weight and use anchors list if possible
+    for k in keys:
+        nk = norm(k)
+        if nk.startswith("head.classification_head.module_list.") and nk.endswith(".weight"):
+            # parse index
+            try:
+                idx = int(nk.split(".")[4])
+            except Exception:
+                continue
+            if idx < 0 or idx >= len(SSD_ANCHORS_PER_LOC):
+                continue
+            out_ch = int(sd[k].shape[0])
+            a = SSD_ANCHORS_PER_LOC[idx]
+            if out_ch % a != 0:
+                continue
+            return out_ch // a
+
+    return None
 
 
 def build_model(arch: str, source: str, num_classes: int) -> torch.nn.Module:
@@ -80,7 +144,6 @@ def build_model(arch: str, source: str, num_classes: int) -> torch.nn.Module:
     if arch.startswith("detr"):
         if source == "hub":
             m = torch.hub.load("facebookresearch/detr", arch, pretrained=False)
-            # hub DETR uses num_classes+1 (includes "no object")
             if hasattr(m, "class_embed") and getattr(m.class_embed, "out_features", None) not in (None, num_classes + 1):
                 try:
                     in_f = m.class_embed.in_features
@@ -96,18 +159,17 @@ def build_model(arch: str, source: str, num_classes: int) -> torch.nn.Module:
             raise ValueError("torchvision doesn't expose detr_resnet50 in this version; use --source hub.")
         raise ValueError("For DETR, use --source hub or --source torchvision.")
 
-    # SSD family (torchvision)
+    # SSD family (torchvision) - avoid backbone downloads:
     import torchvision
     if arch == "ssd300_vgg16":
-        return torchvision.models.detection.ssd300_vgg16(weights=None, num_classes=num_classes)
+        return torchvision.models.detection.ssd300_vgg16(weights=None, weights_backbone=None, num_classes=num_classes)
     if arch == "ssdlite320_mobilenet_v3_large":
-        return torchvision.models.detection.ssdlite320_mobilenet_v3_large(weights=None, num_classes=num_classes)
+        return torchvision.models.detection.ssdlite320_mobilenet_v3_large(weights=None, weights_backbone=None, num_classes=num_classes)
 
     raise ValueError(f"Unsupported arch: {arch}")
 
 
 class SSDOnnxWrapper(torch.nn.Module):
-    """Torchvision SSD -> pad detections to tensors for ONNX."""
     def __init__(self, model: torch.nn.Module, max_dets: int = 100):
         super().__init__()
         self.model = model
@@ -115,7 +177,7 @@ class SSDOnnxWrapper(torch.nn.Module):
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor):
-        dets = self.model(list(x))  # List[Dict]
+        dets = self.model(list(x))
         B = x.shape[0]
         device = x.device
         boxes = torch.zeros((B, self.max_dets, 4), device=device, dtype=torch.float32)
@@ -131,12 +193,10 @@ class SSDOnnxWrapper(torch.nn.Module):
                 boxes[i, :n] = b[:n]
                 scores[i, :n] = s[:n]
                 labels[i, :n] = l[:n]
-
         return boxes, scores, labels
 
 
 class DETROnnxWrapper(torch.nn.Module):
-    """Return raw DETR tensors (pred_logits, pred_boxes)."""
     def __init__(self, model: torch.nn.Module):
         super().__init__()
         self.model = model
@@ -153,25 +213,54 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", required=True,
                     choices=["ssd300_vgg16", "ssdlite320_mobilenet_v3_large", "detr_resnet50", "detr_resnet101"])
-    ap.add_argument("--source", default="torchvision", choices=["torchvision", "hub"],
-                    help="Where to build DETR from. SSD is always torchvision.")
-    ap.add_argument("--checkpoint", default="", help=".pth checkpoint path (optional)")
-    ap.add_argument("--num-classes", type=int, required=True, help="Number of classes in your training (no mapping).")
+    ap.add_argument("--source", default="torchvision", choices=["torchvision", "hub"])
+    ap.add_argument("--checkpoint", default="", help=".pth checkpoint path")
+    ap.add_argument("--num-classes", type=int, default=0,
+                    help="Num classes INCLUDING background for SSD. If 0, requires --auto-num-classes for SSD.")
+    ap.add_argument("--auto-num-classes", action="store_true",
+                    help="SSD only: infer num_classes from checkpoint head shapes.")
+    ap.add_argument("--allow-head-mismatch", action="store_true",
+                    help="If set, will drop mismatched head tensors instead of failing (NOT recommended for correct export).")
 
-    ap.add_argument("--img-size", nargs=2, type=int, default=[800, 800], help="H W dummy input size for export")
+    ap.add_argument("--img-size", nargs=2, type=int, default=[800, 800])
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--opset", type=int, default=17)
+    ap.add_argument("--max-dets", type=int, default=100)
 
-    ap.add_argument("--max-dets", type=int, default=100, help="SSD only: pad detections to this many boxes")
-
-    ap.add_argument("--out", required=True, help="Output .onnx path")
-    ap.add_argument("--fp16", action="store_true", help="Export with fp16 dummy input (model still fp32 unless you cast).")
-    ap.add_argument("--dynamic-batch", action="store_true", help="Make batch dimension dynamic in ONNX.")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--fp16", action="store_true")
+    ap.add_argument("--dynamic-batch", action="store_true")
     args = ap.parse_args()
 
-    model = build_model(args.arch, args.source, args.num_classes)
-    if args.checkpoint:
-        load_checkpoint_flexible(model, args.checkpoint)
+    if not args.checkpoint:
+        raise SystemExit("ERROR: --checkpoint is required for your use case (export trained model).")
+
+    arch_is_ssd = args.arch.startswith("ssd") or args.arch.startswith("ssdlite")
+    num_classes = args.num_classes
+
+    if arch_is_ssd and (num_classes <= 0):
+        if not args.auto_num_classes:
+            raise SystemExit("ERROR: SSD needs --num-classes (includes background) or use --auto-num-classes.")
+        inferred = infer_ssd_num_classes_from_ckpt(args.checkpoint)
+        if inferred is None:
+            raise SystemExit("ERROR: Could not infer num_classes from checkpoint. Provide --num-classes explicitly.")
+        num_classes = inferred
+        print(f"[INFO] Inferred SSD num_classes (includes background) = {num_classes}")
+
+    model = build_model(args.arch, args.source, int(num_classes))
+
+    # load checkpoint
+    try:
+        load_checkpoint_flexible(model, args.checkpoint, strict_shapes=not args.allow_head_mismatch)
+    except RuntimeError as e:
+        # if SSD mismatch, give a direct hint
+        if arch_is_ssd:
+            inferred = infer_ssd_num_classes_from_ckpt(args.checkpoint)
+            if inferred is not None:
+                print(f"[HINT] Your checkpoint looks like SSD num_classes={inferred} (includes background).")
+                print("[HINT] Re-run with: --num-classes", inferred, "or add --auto-num-classes")
+        raise
+
     model.eval()
 
     H, W = int(args.img_size[0]), int(args.img_size[1])
@@ -181,8 +270,6 @@ def main():
     dynamic_axes: Dict[str, Dict[int, str]] = {}
     if args.dynamic_batch:
         dynamic_axes["input"] = {0: "batch"}
-
-    input_names = ["input"]
 
     if args.arch.startswith("detr"):
         wrapper = DETROnnxWrapper(model)
@@ -207,7 +294,7 @@ def main():
         export_params=True,
         opset_version=args.opset,
         do_constant_folding=True,
-        input_names=input_names,
+        input_names=["input"],
         output_names=output_names,
         dynamic_axes=dynamic_axes if dynamic_axes else None,
     )
