@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
-"""benchmark_backends_v8.py
+"""benchmark_backends_v9.py
 
-Fix for v5 error with ImageFolder:
-- ImageFolder DataLoader yields (images, labels) tuples, not dicts.
-- This version accepts BOTH dict batches and tuple/list batches.
+Adds precision/recall/F1 (micro|macro|weighted) to the CSV + prints.
+Works with ImageFolder subset (tuple batches) and keeps TRT via ctypes+libcudart.
 
-Also:
-- TensorRT runner uses ctypes+libcudart (no cuda-python/pycuda needed).
-- ORT CUDA EP still needs CUDA12+cuDNN9+libcublasLt.so.12. Use --ort-provider cpu if missing.
-
-Run (inside container):
-  python benchmark_backends_v8.py \
-    --model vit_b_16 --num-classes 100 \
-    --checkpoint /app/checkpoints/best_model.pth \
-    --onnx /app/checkpoints/vit16_fp32.onnx \
-    --engine /app/checkpoints/vit_fp16.engine \
-    --csv /app/checkpoints/bench_results.csv \
-    --data-dir /data/mini_imagenet_subset/validation \
-    --batch-size 1 --num-workers 0 --warmup-batches 0 --max-batches 200 \
-    --ort-provider cpu
+Example:
+python /app/benchmark_backends_v9.py \
+  --model vit_b_16 --num-classes 100 \
+  --checkpoint /app/checkpoints/best_model.pth \
+  --onnx /app/checkpoints/vit16_fp32.onnx \
+  --engine /app/checkpoints/vit_fp16.engine \
+  --csv /app/checkpoints/bench_results.csv \
+  --data-dir /data/mini_imagenet_subset/validation \
+  --batch-size 1 --num-workers 0 --warmup-batches 0 --max-batches 200 \
+  --avg macro \
+  --ort-provider cpu
 """
 
 from __future__ import annotations
@@ -95,10 +91,17 @@ def append_csv(csv_path: str, row: Dict[str, Any]) -> None:
         w.writerow(row)
 
 
-def safe_record(common: Dict[str, Any], backend: str, csv_path: str, *, accuracy=None, ms=None, fps=None, timed_images=None, error_msg="", extra: Dict[str, Any] | None = None):
+def safe_record(common: Dict[str, Any], backend: str, csv_path: str, *, accuracy=None,
+                precision=None, recall=None, f1=None, avg=None,
+                ms=None, fps=None, timed_images=None, error_msg="",
+                extra: Dict[str, Any] | None = None):
     row = {**common,
            "backend": backend,
+           "avg": avg if avg is not None else "",
            "accuracy": accuracy if accuracy is not None else "",
+           "precision": precision if precision is not None else "",
+           "recall": recall if recall is not None else "",
+           "f1": f1 if f1 is not None else "",
            "avg_ms_per_img": ms if ms is not None else "",
            "fps": fps if fps is not None else "",
            "timed_images": timed_images if timed_images is not None else "",
@@ -106,6 +109,49 @@ def safe_record(common: Dict[str, Any], backend: str, csv_path: str, *, accuracy
     if extra:
         row.update(extra)
     append_csv(csv_path, row)
+
+
+def update_confusion(cm: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray, num_classes: int) -> None:
+    y_true = y_true.astype(np.int64).ravel()
+    y_pred = y_pred.astype(np.int64).ravel()
+    m = (y_true >= 0) & (y_true < num_classes) & (y_pred >= 0) & (y_pred < num_classes)
+    y_true = y_true[m]; y_pred = y_pred[m]
+    idx = y_true * num_classes + y_pred
+    binc = np.bincount(idx, minlength=num_classes * num_classes)
+    cm += binc.reshape(num_classes, num_classes)
+
+
+def prf_from_confusion(cm: np.ndarray, avg: str) -> Tuple[float, float, float]:
+    tp = np.diag(cm).astype(np.float64)
+    fp = cm.sum(axis=0).astype(np.float64) - tp
+    fn = cm.sum(axis=1).astype(np.float64) - tp
+    support = cm.sum(axis=1).astype(np.float64)
+
+    if avg == "micro":
+        TP, FP, FN = tp.sum(), fp.sum(), fn.sum()
+        prec = TP / (TP + FP) if (TP + FP) > 0 else 0.0
+        rec = TP / (TP + FN) if (TP + FN) > 0 else 0.0
+        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+        return float(prec), float(rec), float(f1)
+
+    prec_c = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp) > 0)
+    rec_c  = np.divide(tp, tp + fn, out=np.zeros_like(tp), where=(tp + fn) > 0)
+    f1_c   = np.divide(2 * prec_c * rec_c, prec_c + rec_c, out=np.zeros_like(tp), where=(prec_c + rec_c) > 0)
+
+    if avg == "macro":
+        m = support > 0
+        if not np.any(m):
+            return 0.0, 0.0, 0.0
+        return float(prec_c[m].mean()), float(rec_c[m].mean()), float(f1_c[m].mean())
+
+    if avg == "weighted":
+        tot = support.sum()
+        if tot <= 0:
+            return 0.0, 0.0, 0.0
+        w = support / tot
+        return float((prec_c * w).sum()), float((rec_c * w).sum()), float((f1_c * w).sum())
+
+    raise ValueError("avg must be micro|macro|weighted")
 
 
 def make_loader_imagefolder(data_dir: str, batch_size: int, num_workers: int):
@@ -124,12 +170,11 @@ def make_loader_imagefolder(data_dir: str, batch_size: int, num_workers: int):
 
 @torch.no_grad()
 def eval_torch(model, loader, device: str, warmup_batches: int, max_batches: Optional[int],
-               torch_amp: bool, amp_dtype: torch.dtype) -> Tuple[float, float, int]:
+               torch_amp: bool, amp_dtype: torch.dtype, num_classes: int):
     model.eval().to(device)
-    correct = 0
-    total = 0
-    t_sum = 0.0
-    n_imgs_timed = 0
+    correct = 0; total = 0
+    t_sum = 0.0; n_imgs_timed = 0
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
     use_cuda = device.startswith("cuda") and torch.cuda.is_available()
 
     for i, batch in enumerate(loader):
@@ -156,9 +201,10 @@ def eval_torch(model, loader, device: str, warmup_batches: int, max_batches: Opt
         pred = torch.argmax(logits, dim=1)
         correct += (pred == y).sum().item()
         total += y.numel()
+        update_confusion(cm, y.detach().cpu().numpy(), pred.detach().cpu().numpy(), num_classes)
 
     acc = correct / total if total else 0.0
-    return acc, t_sum, n_imgs_timed
+    return acc, t_sum, n_imgs_timed, cm
 
 
 def ort_input_dtype(session) -> np.dtype:
@@ -166,15 +212,14 @@ def ort_input_dtype(session) -> np.dtype:
     return np.float16 if "float16" in t else np.float32
 
 
-def eval_onnx(session, loader, warmup_batches: int, max_batches: Optional[int], device: str) -> Tuple[float, float, int]:
+def eval_onnx(session, loader, warmup_batches: int, max_batches: Optional[int], device: str, num_classes: int):
     inp_name = session.get_inputs()[0].name
     out_name = session.get_outputs()[0].name
     dtype = ort_input_dtype(session)
 
-    correct = 0
-    total = 0
-    t_sum = 0.0
-    n_imgs_timed = 0
+    correct = 0; total = 0
+    t_sum = 0.0; n_imgs_timed = 0
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
     use_cuda = device.startswith("cuda") and torch.cuda.is_available()
 
     for i, batch in enumerate(loader):
@@ -194,18 +239,19 @@ def eval_onnx(session, loader, warmup_batches: int, max_batches: Optional[int], 
             n_imgs_timed += x.shape[0]
 
         pred = logits.argmax(axis=1)
-        correct += (pred == y.numpy()).sum()
-        total += y.shape[0]
+        y_np = y.numpy()
+        correct += (pred == y_np).sum()
+        total += y_np.shape[0]
+        update_confusion(cm, y_np, pred, num_classes)
 
     acc = float(correct) / float(total) if total else 0.0
-    return acc, t_sum, n_imgs_timed
+    return acc, t_sum, n_imgs_timed, cm
 
 
 class Cudart:
     def __init__(self):
         names = ["libcudart.so", "libcudart.so.12", "libcudart.so.11.0"]
-        lib = None
-        last = None
+        lib = None; last = None
         for n in names:
             try:
                 lib = ctypes.CDLL(n)
@@ -214,7 +260,6 @@ class Cudart:
                 last = e
         if lib is None:
             raise RuntimeError(f"Could not load libcudart: {last}")
-        self.lib = lib
 
         self.cudaMalloc = lib.cudaMalloc
         self.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
@@ -327,7 +372,7 @@ class TrtRunnerCtypes:
         y = np.empty(self.out_shape, dtype=self.out_dtype)
 
         err = self.cudart.cudaMemcpyAsync(self.d_in, ctypes.c_void_p(x_np.ctypes.data), x_np.nbytes,
-                                         self.cudart.cudaMemcpyHostToDevice, self.stream)
+                                         self.cudaMemcpyHostToDevice, self.stream)
         if err != 0:
             raise RuntimeError(f"cudaMemcpyAsync H2D failed: {err}")
 
@@ -338,7 +383,7 @@ class TrtRunnerCtypes:
             raise RuntimeError("TensorRT execute_async_v3 returned False")
 
         err = self.cudart.cudaMemcpyAsync(ctypes.c_void_p(y.ctypes.data), self.d_out, y.nbytes,
-                                         self.cudart.cudaMemcpyDeviceToHost, self.stream)
+                                         self.cudaMemcpyDeviceToHost, self.stream)
         if err != 0:
             raise RuntimeError(f"cudaMemcpyAsync D2H failed: {err}")
 
@@ -347,6 +392,14 @@ class TrtRunnerCtypes:
             raise RuntimeError(f"cudaStreamSynchronize failed: {err}")
 
         return y
+
+    @property
+    def cudaMemcpyHostToDevice(self):  # for shorthand above
+        return self.cudart.cudaMemcpyHostToDevice
+
+    @property
+    def cudaMemcpyDeviceToHost(self):
+        return self.cudart.cudaMemcpyDeviceToHost
 
     def close(self):
         if self.d_in.value:
@@ -357,7 +410,7 @@ class TrtRunnerCtypes:
             self.cudart.cudaStreamDestroy(self.stream)
 
 
-def eval_trt(engine_path: str, loader, warmup_batches: int, max_batches: Optional[int], device: str) -> Tuple[float, float, int]:
+def eval_trt(engine_path: str, loader, warmup_batches: int, max_batches: Optional[int], device: str, num_classes: int):
     import tensorrt as trt
     engine = load_trt_engine(engine_path)
     in_name, _ = trt_get_io_names(engine)
@@ -366,10 +419,9 @@ def eval_trt(engine_path: str, loader, warmup_batches: int, max_batches: Optiona
 
     runner = TrtRunnerCtypes(engine)
 
-    correct = 0
-    total = 0
-    t_sum = 0.0
-    n_imgs_timed = 0
+    correct = 0; total = 0
+    t_sum = 0.0; n_imgs_timed = 0
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
     use_cuda = device.startswith("cuda") and torch.cuda.is_available()
 
     try:
@@ -390,13 +442,15 @@ def eval_trt(engine_path: str, loader, warmup_batches: int, max_batches: Optiona
                 n_imgs_timed += x.shape[0]
 
             pred = logits.argmax(axis=1)
-            correct += (pred == y.numpy()).sum()
-            total += y.shape[0]
+            y_np = y.numpy()
+            correct += (pred == y_np).sum()
+            total += y_np.shape[0]
+            update_confusion(cm, y_np, pred, num_classes)
     finally:
         runner.close()
 
     acc = float(correct) / float(total) if total else 0.0
-    return acc, t_sum, n_imgs_timed
+    return acc, t_sum, n_imgs_timed, cm
 
 
 def main():
@@ -415,6 +469,8 @@ def main():
     ap.add_argument("--warmup-batches", type=int, default=0)
     ap.add_argument("--max-batches", type=int, default=None)
     ap.add_argument("--torch-amp", action="store_true")
+
+    ap.add_argument("--avg", choices=["micro", "macro", "weighted"], default="macro")
 
     ap.add_argument("--ort-provider", choices=["cuda", "cpu", "auto"], default="auto")
     ap.add_argument("--skip-onnx", action="store_true")
@@ -444,16 +500,17 @@ def main():
     )
 
     try:
-        acc_t, t_sum_t, n_imgs_t = eval_torch(model, loader, args.device, args.warmup_batches, max_batches, args.torch_amp, torch.float16)
+        acc_t, t_sum_t, n_imgs_t, cm_t = eval_torch(model, loader, args.device, args.warmup_batches, max_batches, args.torch_amp, torch.float16, args.num_classes)
+        p_t, r_t, f_t = prf_from_confusion(cm_t, args.avg)
         ms_t, fps_t = ms_per_img_and_fps(t_sum_t, n_imgs_t)
-        safe_record(common, "torch", args.csv, accuracy=acc_t, ms=ms_t, fps=fps_t, timed_images=n_imgs_t)
-        print(f"Torch: acc={acc_t:.4f} | {ms_t} ms/img | FPS={fps_t}")
+        safe_record(common, "torch", args.csv, avg=args.avg, accuracy=acc_t, precision=p_t, recall=r_t, f1=f_t, ms=ms_t, fps=fps_t, timed_images=n_imgs_t)
+        print(f"Torch: acc={acc_t:.4f} | P={p_t:.4f} R={r_t:.4f} F1={f_t:.4f} ({args.avg}) | {ms_t} ms/img | FPS={fps_t}")
     except Exception as e:
-        safe_record(common, "torch", args.csv, error_msg=f"{type(e).__name__}: {e}")
+        safe_record(common, "torch", args.csv, avg=args.avg, error_msg=f"{type(e).__name__}: {e}")
         print(f"[ERR] Torch failed: {type(e).__name__}: {e}")
 
     if args.skip_onnx:
-        safe_record(common, "onnxruntime", args.csv, error_msg="SKIPPED")
+        safe_record(common, "onnxruntime", args.csv, avg=args.avg, error_msg="SKIPPED")
     else:
         import onnxruntime as ort
         if args.ort_provider == "cpu":
@@ -465,27 +522,29 @@ def main():
         try:
             sess = ort.InferenceSession(args.onnx, providers=providers)
             used = sess.get_providers()
-            acc_o, t_sum_o, n_imgs_o = eval_onnx(sess, loader, args.warmup_batches, max_batches, args.device)
+            acc_o, t_sum_o, n_imgs_o, cm_o = eval_onnx(sess, loader, args.warmup_batches, max_batches, args.device, args.num_classes)
+            p_o, r_o, f_o = prf_from_confusion(cm_o, args.avg)
             ms_o, fps_o = ms_per_img_and_fps(t_sum_o, n_imgs_o)
             safe_record(common, "onnxruntime_" + ("cuda" if "CUDAExecutionProvider" in used else "cpu"),
-                        args.csv, accuracy=acc_o, ms=ms_o, fps=fps_o, timed_images=n_imgs_o,
+                        args.csv, avg=args.avg, accuracy=acc_o, precision=p_o, recall=r_o, f1=f_o, ms=ms_o, fps=fps_o, timed_images=n_imgs_o,
                         extra={"ort_used": "|".join(used)})
-            print(f"ORT({used[0]}): acc={acc_o:.4f} | {ms_o} ms/img | FPS={fps_o}")
+            print(f"ORT({used[0]}): acc={acc_o:.4f} | P={p_o:.4f} R={r_o:.4f} F1={f_o:.4f} ({args.avg}) | {ms_o} ms/img | FPS={fps_o}")
         except Exception as e:
-            safe_record(common, "onnxruntime", args.csv, error_msg=f"{type(e).__name__}: {e}")
+            safe_record(common, "onnxruntime", args.csv, avg=args.avg, error_msg=f"{type(e).__name__}: {e}")
             print(f"[ERR] ORT failed: {type(e).__name__}: {e}")
 
     if args.skip_trt:
-        safe_record(common, "tensorrt_engine", args.csv, error_msg="SKIPPED")
+        safe_record(common, "tensorrt_engine", args.csv, avg=args.avg, error_msg="SKIPPED")
     else:
         try:
-            acc_e, t_sum_e, n_imgs_e = eval_trt(args.engine, loader, args.warmup_batches, max_batches, args.device)
+            acc_e, t_sum_e, n_imgs_e, cm_e = eval_trt(args.engine, loader, args.warmup_batches, max_batches, args.device, args.num_classes)
+            p_e, r_e, f_e = prf_from_confusion(cm_e, args.avg)
             ms_e, fps_e = ms_per_img_and_fps(t_sum_e, n_imgs_e)
-            safe_record(common, "tensorrt_engine", args.csv, accuracy=acc_e, ms=ms_e, fps=fps_e, timed_images=n_imgs_e,
+            safe_record(common, "tensorrt_engine", args.csv, avg=args.avg, accuracy=acc_e, precision=p_e, recall=r_e, f1=f_e, ms=ms_e, fps=fps_e, timed_images=n_imgs_e,
                         extra={"trt_backend": "ctypes-cudart"})
-            print(f"TRT(ctypes-cudart): acc={acc_e:.4f} | {ms_e} ms/img | FPS={fps_e}")
+            print(f"TRT(ctypes-cudart): acc={acc_e:.4f} | P={p_e:.4f} R={r_e:.4f} F1={f_e:.4f} ({args.avg}) | {ms_e} ms/img | FPS={fps_e}")
         except Exception as e:
-            safe_record(common, "tensorrt_engine", args.csv, error_msg=f"{type(e).__name__}: {e}")
+            safe_record(common, "tensorrt_engine", args.csv, avg=args.avg, error_msg=f"{type(e).__name__}: {e}")
             print(f"[ERR] TRT failed: {type(e).__name__}: {e}")
 
     print(f"[OK] CSV appended: {os.path.abspath(args.csv)}")
