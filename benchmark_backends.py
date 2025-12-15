@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 """
-benchmark_backends.py
+benchmark_backends_v4.py
 
-Given:
-  - a Torch checkpoint (.pth) for resnet18 or vit_b_16,
-  - an ONNX file (benchmarked with ONNX Runtime CUDA EP),
-  - a TensorRT engine (.engine) built in FP16,
+Based on v3, but fixes the most common reason TensorRT works in trtexec
+and fails in Python:
 
-Compute:
-  - top-1 accuracy,
-  - average inference latency (ms / image),
-  - FPS,
+1) Determines input/output tensor names by TensorIOMode (NOT by index).
+2) Uses a single persistent CUDA stream + device buffers (no malloc/free per batch).
+3) Avoids pycuda by default (uses cuda-python). Falls back to pycuda only if you ask.
+4) Recommends num_workers=0 when benchmarking TRT to avoid CUDA context/thread issues.
 
-and append results to a CSV.
-
-Notes:
-  - Default dataset is HuggingFace "timm/mini-imagenet" (validation split), as in your notebook.
-  - TensorRT engine execution uses the TensorRT Python API + CUDA (prefers cuda-python; falls back to pycuda).
+This matches your trtexec info:
+  input  : name="input"  shape=1x3x224x224
+  output : name="logits" shape=1x100
 """
+
 from __future__ import annotations
 import argparse, os, time, csv, datetime
 from collections import OrderedDict
@@ -28,9 +25,11 @@ import torch
 from torch import nn
 import torchvision
 
+
 def _sync_if_cuda(device: str):
     if isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
+
 
 def build_model(name: str, num_classes: int) -> torch.nn.Module:
     name = name.lower()
@@ -43,6 +42,7 @@ def build_model(name: str, num_classes: int) -> torch.nn.Module:
         model.heads.head = nn.Linear(model.heads.head.in_features, num_classes)
         return model
     raise ValueError(f"Unsupported --model '{name}'. Use resnet18 or vit_b_16.")
+
 
 def load_checkpoint_flexible(model: torch.nn.Module, ckpt_path: str) -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -67,22 +67,9 @@ def load_checkpoint_flexible(model: torch.nn.Module, ckpt_path: str) -> None:
     if unexpected:
         print(f"[WARN] Unexpected keys (showing up to 20): {unexpected[:20]}  (total={len(unexpected)})")
 
+
 def make_loader(dataset_name: str, split: str, batch_size: int, num_workers: int,
                 num_samples: int = 0, streaming: bool = False, cache_dir: str = ""):
-    """
-    Builds a DataLoader for a HuggingFace dataset.
-
-    num_samples:
-      - 0 means "use full split"
-      - >0 limits to the first N samples (useful to avoid long downloads / quick benchmarks)
-
-    streaming:
-      - If True, uses HF streaming mode (doesn't materialize the whole dataset locally).
-        Great for quick benchmarks; you'll still download the samples you iterate.
-
-    cache_dir:
-      - Optional HF datasets cache directory.
-    """
     from datasets import load_dataset
     import torchvision.transforms as T
     from torch.utils.data import DataLoader, IterableDataset
@@ -111,119 +98,80 @@ def make_loader(dataset_name: str, split: str, batch_size: int, num_workers: int
                     if num_samples and n >= num_samples:
                         break
 
-        ds = WrappedIter()
-        loader = DataLoader(
-            ds,
-            batch_size=batch_size,
-            num_workers=0,        # streaming: keep simple; workers may duplicate streams
-            pin_memory=True,
-        )
-        return loader
+        # streaming + CUDA: keep workers at 0 to avoid duplicated streams/process issues
+        return DataLoader(WrappedIter(), batch_size=batch_size, num_workers=0, pin_memory=True)
 
     ds_dict = load_dataset(dataset_name, cache_dir=cache_dir if cache_dir else None)
     ds = ds_dict[split]
-
     if num_samples and num_samples > 0:
-        num_samples = min(num_samples, len(ds))
-        ds = ds.select(range(num_samples))
+        ds = ds.select(range(min(num_samples, len(ds))))
 
     def apply_transforms(examples):
         examples["image"] = [transform(img.convert("RGB")) for img in examples["image"]]
         return examples
 
     ds.set_transform(apply_transforms, columns=["image"], output_all_columns=True)
+    return DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    loader = DataLoader(
-        ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-    return loader
 
 @torch.no_grad()
-def eval_torch(
-    model: torch.nn.Module,
-    loader,
-    device: str,
-    warmup_batches: int,
-    max_batches: Optional[int],
-    torch_amp: bool,
-    amp_dtype: torch.dtype,
-) -> Tuple[float, float, int]:
+def eval_torch(model, loader, device: str, warmup_batches: int, max_batches: Optional[int],
+               torch_amp: bool, amp_dtype: torch.dtype) -> Tuple[float, float, int]:
     model.eval().to(device)
     correct = 0
     total = 0
-    infer_time_sum = 0.0
+    t_sum = 0.0
     n_imgs_timed = 0
-
-    use_cuda = (isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available())
+    use_cuda = device.startswith("cuda") and torch.cuda.is_available()
 
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
+        x = batch["image"]; y = batch["label"]
+        x = x.to(device, non_blocking=True); y = y.to(device, non_blocking=True)
 
-        x = batch["image"] if isinstance(batch, dict) else batch[0]
-        y = batch["label"] if isinstance(batch, dict) else batch[1]
-
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        if use_cuda:
-            torch.cuda.synchronize()
+        if use_cuda: torch.cuda.synchronize()
         t0 = time.perf_counter()
         if torch_amp and use_cuda:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
                 logits = model(x)
         else:
             logits = model(x)
-        if use_cuda:
-            torch.cuda.synchronize()
+        if use_cuda: torch.cuda.synchronize()
         t1 = time.perf_counter()
 
         if i >= warmup_batches:
-            infer_time_sum += (t1 - t0)
+            t_sum += (t1 - t0)
             n_imgs_timed += x.shape[0]
 
-        preds = torch.argmax(logits, dim=1)
-        correct += (preds == y).sum().item()
+        pred = torch.argmax(logits, dim=1)
+        correct += (pred == y).sum().item()
         total += y.numel()
 
     acc = correct / total if total else 0.0
-    return acc, infer_time_sum, n_imgs_timed
+    return acc, t_sum, n_imgs_timed
+
 
 def ort_input_dtype(session) -> np.dtype:
     t = session.get_inputs()[0].type
-    # examples: 'tensor(float)', 'tensor(float16)'
-    if "float16" in t:
-        return np.float16
-    return np.float32
+    return np.float16 if "float16" in t else np.float32
 
-def eval_onnx(
-    session,
-    loader,
-    warmup_batches: int,
-    max_batches: Optional[int],
-    device: str,
-) -> Tuple[float, float, int]:
+
+def eval_onnx(session, loader, warmup_batches: int, max_batches: Optional[int], device: str) -> Tuple[float, float, int]:
     inp_name = session.get_inputs()[0].name
     out_name = session.get_outputs()[0].name
     dtype = ort_input_dtype(session)
 
     correct = 0
     total = 0
-    infer_time_sum = 0.0
+    t_sum = 0.0
     n_imgs_timed = 0
 
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-
-        x = batch["image"] if isinstance(batch, dict) else batch[0]
-        y = batch["label"] if isinstance(batch, dict) else batch[1]
-
-        x_np = x.detach().cpu().numpy().astype(dtype, copy=False)
+        x = batch["image"]; y = batch["label"]
+        x_np = x.numpy().astype(dtype, copy=False)
 
         _sync_if_cuda(device)
         t0 = time.perf_counter()
@@ -232,15 +180,16 @@ def eval_onnx(
         t1 = time.perf_counter()
 
         if i >= warmup_batches:
-            infer_time_sum += (t1 - t0)
+            t_sum += (t1 - t0)
             n_imgs_timed += x.shape[0]
 
-        preds = logits.argmax(axis=1)
-        correct += (preds == y.cpu().numpy()).sum()
+        pred = logits.argmax(axis=1)
+        correct += (pred == y.numpy()).sum()
         total += y.shape[0]
 
     acc = float(correct) / float(total) if total else 0.0
-    return acc, infer_time_sum, n_imgs_timed
+    return acc, t_sum, n_imgs_timed
+
 
 def load_trt_engine(engine_path: str):
     import tensorrt as trt
@@ -251,186 +200,164 @@ def load_trt_engine(engine_path: str):
         raise RuntimeError("Failed to deserialize TensorRT engine.")
     return engine
 
-def trt_infer_fn(engine, device_id: int = 0):
-    """
-    Returns a callable: (x_np_float32_or_float16) -> logits_np
-    Prefers cuda-python. Falls back to pycuda if needed.
-    """
-    # --- try cuda-python first ---
-    try:
-        from cuda import cudart
-        import tensorrt as trt
 
-        ctx = engine.create_execution_context()
-        if ctx is None:
+def trt_get_io_names(engine):
+    import tensorrt as trt
+    inputs, outputs = [], []
+    for i in range(engine.num_io_tensors):
+        name = engine.get_tensor_name(i)
+        mode = engine.get_tensor_mode(name)
+        if mode == trt.TensorIOMode.INPUT:
+            inputs.append(name)
+        else:
+            outputs.append(name)
+    if len(inputs) != 1 or len(outputs) != 1:
+        raise RuntimeError(f"Expected 1 input/1 output, got inputs={inputs}, outputs={outputs}")
+    return inputs[0], outputs[0]
+
+
+class TrtRunnerCudaPython:
+    def __init__(self, engine):
+        import tensorrt as trt
+        from cuda import cudart
+
+        self.trt = trt
+        self.cudart = cudart
+        self.engine = engine
+        self.ctx = engine.create_execution_context()
+        if self.ctx is None:
             raise RuntimeError("Failed to create TRT execution context.")
 
-        # assume single input / single output classification
-        in_idx = 0
-        out_idx = 1 if engine.num_io_tensors >= 2 else 0
+        self.in_name, self.out_name = trt_get_io_names(engine)
 
-        in_name = engine.get_tensor_name(in_idx)
-        out_name = engine.get_tensor_name(out_idx)
+        # allocate stream once
+        err, self.stream = cudart.cudaStreamCreate()
+        if err != 0:
+            raise RuntimeError(f"cudaStreamCreate failed with code {err}")
 
-        def infer(x_np: np.ndarray) -> np.ndarray:
-            assert x_np.ndim == 4, f"expected NCHW, got {x_np.shape}"
-            # set shapes for dynamic
-            ctx.set_input_shape(in_name, x_np.shape)
+        # buffers (allocated lazily per shape)
+        self.d_in = None
+        self.d_out = None
+        self.in_bytes = 0
+        self.out_bytes = 0
+        self.out_shape = None
+        self.out_dtype = None
 
-            # allocate output
-            out_shape = tuple(ctx.get_tensor_shape(out_name))
-            out_dtype = np.float16 if engine.get_tensor_dtype(out_name) == trt.DataType.HALF else np.float32
-            y = np.empty(out_shape, dtype=out_dtype)
+    def _ensure_buffers(self, x_np: np.ndarray):
+        # set dynamic shape
+        self.ctx.set_input_shape(self.in_name, x_np.shape)
+        out_shape = tuple(self.ctx.get_tensor_shape(self.out_name))
 
-            # malloc
-            err, d_in = cudart.cudaMalloc(x_np.nbytes)
+        # output dtype from engine
+        dt = self.engine.get_tensor_dtype(self.out_name)
+        self.out_dtype = np.float16 if dt == self.trt.DataType.HALF else np.float32
+        self.out_shape = out_shape
+
+        need_in = x_np.nbytes
+        y_nbytes = np.empty(out_shape, dtype=self.out_dtype).nbytes
+
+        # (re)alloc if needed
+        if self.d_in is None or need_in > self.in_bytes:
+            if self.d_in is not None:
+                self.cudart.cudaFree(self.d_in)
+            err, self.d_in = self.cudart.cudaMalloc(need_in)
             if err != 0:
                 raise RuntimeError(f"cudaMalloc input failed with code {err}")
-            err, d_out = cudart.cudaMalloc(y.nbytes)
+            self.in_bytes = need_in
+
+        if self.d_out is None or y_nbytes > self.out_bytes:
+            if self.d_out is not None:
+                self.cudart.cudaFree(self.d_out)
+            err, self.d_out = self.cudart.cudaMalloc(y_nbytes)
             if err != 0:
                 raise RuntimeError(f"cudaMalloc output failed with code {err}")
+            self.out_bytes = y_nbytes
 
-            # create stream
-            err, stream = cudart.cudaStreamCreate()
-            if err != 0:
-                raise RuntimeError(f"cudaStreamCreate failed with code {err}")
-
-            try:
-                # H2D
-                err = cudart.cudaMemcpyAsync(d_in, x_np.ctypes.data, x_np.nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, stream)[0]
-                if err != 0:
-                    raise RuntimeError(f"cudaMemcpyAsync H2D failed with code {err}")
-
-                # bind pointers
-                ctx.set_tensor_address(in_name, int(d_in))
-                ctx.set_tensor_address(out_name, int(d_out))
-
-                # execute
-                if not ctx.execute_async_v3(stream):
-                    raise RuntimeError("TensorRT execution failed.")
-
-                # D2H
-                err = cudart.cudaMemcpyAsync(y.ctypes.data, d_out, y.nbytes, cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, stream)[0]
-                if err != 0:
-                    raise RuntimeError(f"cudaMemcpyAsync D2H failed with code {err}")
-
-                # sync
-                err = cudart.cudaStreamSynchronize(stream)[0]
-                if err != 0:
-                    raise RuntimeError(f"cudaStreamSynchronize failed with code {err}")
-            finally:
-                cudart.cudaStreamDestroy(stream)
-                cudart.cudaFree(d_in)
-                cudart.cudaFree(d_out)
-
-            return y
-
-        return infer
-
-    except Exception as e_cuda:
-        print(f"[INFO] cuda-python path not available / failed ({type(e_cuda).__name__}: {e_cuda}). Trying pycuda...")
-
-    # --- fallback: pycuda ---
-    import tensorrt as trt
-    import pycuda.driver as cuda
-    import pycuda.autoinit  # noqa: F401
-
-    ctx = engine.create_execution_context()
-    if ctx is None:
-        raise RuntimeError("Failed to create TRT execution context.")
-
-    in_idx = 0
-    out_idx = 1 if engine.num_io_tensors >= 2 else 0
-    in_name = engine.get_tensor_name(in_idx)
-    out_name = engine.get_tensor_name(out_idx)
-
-    def infer(x_np: np.ndarray) -> np.ndarray:
-        assert x_np.ndim == 4, f"expected NCHW, got {x_np.shape}"
-        ctx.set_input_shape(in_name, x_np.shape)
-
-        out_shape = tuple(ctx.get_tensor_shape(out_name))
-        out_dtype = np.float16 if engine.get_tensor_dtype(out_name) == trt.DataType.HALF else np.float32
-        y = np.empty(out_shape, dtype=out_dtype)
-
-        d_in = cuda.mem_alloc(x_np.nbytes)
-        d_out = cuda.mem_alloc(y.nbytes)
-        stream = cuda.Stream()
+    def infer(self, x_np: np.ndarray) -> np.ndarray:
+        self._ensure_buffers(x_np)
+        y = np.empty(self.out_shape, dtype=self.out_dtype)
 
         # H2D
-        cuda.memcpy_htod_async(d_in, x_np, stream)
+        err = self.cudart.cudaMemcpyAsync(self.d_in, x_np.ctypes.data, x_np.nbytes,
+                                         self.cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, self.stream)[0]
+        if err != 0:
+            raise RuntimeError(f"cudaMemcpyAsync H2D failed with code {err}")
 
-        ctx.set_tensor_address(in_name, int(d_in))
-        ctx.set_tensor_address(out_name, int(d_out))
+        # bind
+        self.ctx.set_tensor_address(self.in_name, int(self.d_in))
+        self.ctx.set_tensor_address(self.out_name, int(self.d_out))
 
-        if not ctx.execute_async_v3(stream.handle):
-            raise RuntimeError("TensorRT execution failed.")
+        # exec
+        if not self.ctx.execute_async_v3(self.stream):
+            raise RuntimeError("TensorRT execute_async_v3 returned False")
 
         # D2H
-        cuda.memcpy_dtoh_async(y, d_out, stream)
-        stream.synchronize()
+        err = self.cudart.cudaMemcpyAsync(y.ctypes.data, self.d_out, y.nbytes,
+                                         self.cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost, self.stream)[0]
+        if err != 0:
+            raise RuntimeError(f"cudaMemcpyAsync D2H failed with code {err}")
 
-        d_in.free()
-        d_out.free()
+        # sync
+        err = self.cudart.cudaStreamSynchronize(self.stream)[0]
+        if err != 0:
+            raise RuntimeError(f"cudaStreamSynchronize failed with code {err}")
+
         return y
 
-    return infer
+    def close(self):
+        if self.d_in is not None:
+            self.cudart.cudaFree(self.d_in)
+        if self.d_out is not None:
+            self.cudart.cudaFree(self.d_out)
+        self.cudart.cudaStreamDestroy(self.stream)
 
-def eval_trt(
-    engine_path: str,
-    loader,
-    warmup_batches: int,
-    max_batches: Optional[int],
-    device: str,
-) -> Tuple[float, float, int]:
+
+def eval_trt(engine_path: str, loader, warmup_batches: int, max_batches: Optional[int], device: str) -> Tuple[float, float, int]:
+    import tensorrt as trt
     engine = load_trt_engine(engine_path)
-    infer = trt_infer_fn(engine)
+    in_name, _ = trt_get_io_names(engine)
+    in_dtype = engine.get_tensor_dtype(in_name)
+    wanted = np.float16 if in_dtype == trt.DataType.HALF else np.float32
+
+    runner = TrtRunnerCudaPython(engine)
 
     correct = 0
     total = 0
-    infer_time_sum = 0.0
+    t_sum = 0.0
     n_imgs_timed = 0
 
-    # decide input dtype (engine input)
     try:
-        import tensorrt as trt
-        in_name = engine.get_tensor_name(0)
-        in_dtype = engine.get_tensor_dtype(in_name)
-        wanted = np.float16 if in_dtype == trt.DataType.HALF else np.float32
-    except Exception:
-        wanted = np.float32
+        for i, batch in enumerate(loader):
+            if max_batches is not None and i >= max_batches:
+                break
+            x = batch["image"]; y = batch["label"]
+            x_np = x.numpy().astype(wanted, copy=False)
 
-    for i, batch in enumerate(loader):
-        if max_batches is not None and i >= max_batches:
-            break
+            _sync_if_cuda(device)
+            t0 = time.perf_counter()
+            logits = runner.infer(x_np)
+            _sync_if_cuda(device)
+            t1 = time.perf_counter()
 
-        x = batch["image"] if isinstance(batch, dict) else batch[0]
-        y = batch["label"] if isinstance(batch, dict) else batch[1]
+            if i >= warmup_batches:
+                t_sum += (t1 - t0)
+                n_imgs_timed += x.shape[0]
 
-        x_np = x.detach().cpu().numpy().astype(wanted, copy=False)
-
-        _sync_if_cuda(device)
-        t0 = time.perf_counter()
-        logits = infer(x_np)
-        _sync_if_cuda(device)
-        t1 = time.perf_counter()
-
-        if i >= warmup_batches:
-            infer_time_sum += (t1 - t0)
-            n_imgs_timed += x.shape[0]
-
-        preds = logits.argmax(axis=1)
-        correct += (preds == y.cpu().numpy()).sum()
-        total += y.shape[0]
+            pred = logits.argmax(axis=1)
+            correct += (pred == y.numpy()).sum()
+            total += y.shape[0]
+    finally:
+        runner.close()
 
     acc = float(correct) / float(total) if total else 0.0
-    return acc, infer_time_sum, n_imgs_timed
+    return acc, t_sum, n_imgs_timed
+
 
 def ms_per_img_and_fps(t_sum: float, n_imgs: int) -> Tuple[float, float]:
     if n_imgs <= 0 or t_sum <= 0:
         return float("nan"), float("nan")
-    ms_per_img = (t_sum / n_imgs) * 1000.0
-    fps = n_imgs / t_sum
-    return ms_per_img, fps
+    return (t_sum / n_imgs) * 1000.0, n_imgs / t_sum
+
 
 def append_csv(csv_path: str, row: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(csv_path)) or ".", exist_ok=True)
@@ -441,70 +368,52 @@ def append_csv(csv_path: str, row: Dict[str, Any]) -> None:
             w.writeheader()
         w.writerow(row)
 
+
+def safe_record(common: Dict[str, Any], backend: str, csv_path: str, *, accuracy=None, ms=None, fps=None, timed_images=None, error_msg=""):
+    row = {**common,
+           "backend": backend,
+           "accuracy": accuracy if accuracy is not None else "",
+           "avg_ms_per_img": ms if ms is not None else "",
+           "fps": fps if fps is not None else "",
+           "timed_images": timed_images if timed_images is not None else "",
+           "error": error_msg}
+    append_csv(csv_path, row)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, choices=["resnet18", "vit_b_16"])
     ap.add_argument("--num-classes", type=int, default=100)
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--onnx", required=True)
-    ap.add_argument("--engine", required=True, help="TensorRT .engine (FP16) path.")
+    ap.add_argument("--engine", required=True)
     ap.add_argument("--device", default="cuda:0")
+
     ap.add_argument("--dataset", default="timm/mini-imagenet")
     ap.add_argument("--split", default="validation")
-    ap.add_argument("--num-samples", type=int, default=0, help="If >0, only use the first N samples of the split.")
-    ap.add_argument("--streaming", action="store_true", help="Use HuggingFace streaming mode to avoid full downloads.")
-    ap.add_argument("--hf-cache-dir", default="", help="Optional HuggingFace datasets cache dir.")
+    ap.add_argument("--num-samples", type=int, default=0)
+    ap.add_argument("--streaming", action="store_true")
+    ap.add_argument("--hf-cache-dir", default="")
+
     ap.add_argument("--batch-size", type=int, default=1)
-    ap.add_argument("--num-workers", type=int, default=2)
+    ap.add_argument("--num-workers", type=int, default=0, help="Use 0 when benchmarking TRT to avoid CUDA context/thread issues.")
     ap.add_argument("--warmup-batches", type=int, default=10)
-    ap.add_argument("--max-batches", type=int, default=None, help="Limit number of batches for quick tests.")
-    ap.add_argument("--torch-amp", action="store_true", help="Use torch autocast (fp16) during Torch eval.")
-    ap.add_argument("--csv", required=True, help="Output CSV path (appended).")
+    ap.add_argument("--max-batches", type=int, default=None)
+    ap.add_argument("--torch-amp", action="store_true")
+
+    ap.add_argument("--ort-provider", choices=["cuda", "cpu", "auto"], default="auto")
+    ap.add_argument("--skip-onnx", action="store_true")
+    ap.add_argument("--skip-trt", action="store_true")
+
+    ap.add_argument("--csv", required=True)
     args = ap.parse_args()
-
     max_batches = int(args.max_batches) if args.max_batches is not None else None
-    loader = make_loader(args.dataset, args.split, args.batch_size, args.num_workers,
-                         num_samples=args.num_samples,
-                         streaming=args.streaming,
-                         cache_dir=args.hf_cache_dir)
 
-    # ----- Torch -----
+    loader = make_loader(args.dataset, args.split, args.batch_size, args.num_workers,
+                         num_samples=args.num_samples, streaming=args.streaming, cache_dir=args.hf_cache_dir)
+
     model = build_model(args.model, args.num_classes)
     load_checkpoint_flexible(model, args.checkpoint)
-
-    acc_t, t_sum_t, n_imgs_t = eval_torch(
-        model=model,
-        loader=loader,
-        device=args.device,
-        warmup_batches=args.warmup_batches,
-        max_batches=max_batches,
-        torch_amp=args.torch_amp,
-        amp_dtype=torch.float16,
-    )
-    ms_t, fps_t = ms_per_img_and_fps(t_sum_t, n_imgs_t)
-
-    # ----- ONNX Runtime (CUDA EP) -----
-    import onnxruntime as ort
-    providers = [("CUDAExecutionProvider", {"device_id": 0})]
-    sess = ort.InferenceSession(args.onnx, providers=providers)
-    acc_o, t_sum_o, n_imgs_o = eval_onnx(
-        session=sess,
-        loader=loader,
-        warmup_batches=args.warmup_batches,
-        max_batches=max_batches,
-        device=args.device,
-    )
-    ms_o, fps_o = ms_per_img_and_fps(t_sum_o, n_imgs_o)
-
-    # ----- TensorRT engine -----
-    acc_e, t_sum_e, n_imgs_e = eval_trt(
-        engine_path=args.engine,
-        loader=loader,
-        warmup_batches=args.warmup_batches,
-        max_batches=max_batches,
-        device=args.device,
-    )
-    ms_e, fps_e = ms_per_img_and_fps(t_sum_e, n_imgs_e)
 
     ts = datetime.datetime.now().isoformat(timespec="seconds")
     common = dict(
@@ -516,21 +425,63 @@ def main():
         batch_size=args.batch_size,
         warmup_batches=args.warmup_batches,
         max_batches=max_batches if max_batches is not None else "",
+        num_samples=args.num_samples,
+        streaming=args.streaming,
         checkpoint=os.path.abspath(args.checkpoint),
         onnx=os.path.abspath(args.onnx),
         engine=os.path.abspath(args.engine),
+        device=args.device,
+        ort_provider=args.ort_provider,
     )
 
-    # append three rows
-    append_csv(args.csv, {**common, "backend": "torch", "accuracy": acc_t, "avg_ms_per_img": ms_t, "fps": fps_t, "timed_images": n_imgs_t})
-    append_csv(args.csv, {**common, "backend": "onnxruntime_cuda", "accuracy": acc_o, "avg_ms_per_img": ms_o, "fps": fps_o, "timed_images": n_imgs_o})
-    append_csv(args.csv, {**common, "backend": "tensorrt_engine", "accuracy": acc_e, "avg_ms_per_img": ms_e, "fps": fps_e, "timed_images": n_imgs_e})
+    # Torch
+    try:
+        acc_t, t_sum_t, n_imgs_t = eval_torch(model, loader, args.device, args.warmup_batches, max_batches, args.torch_amp, torch.float16)
+        ms_t, fps_t = ms_per_img_and_fps(t_sum_t, n_imgs_t)
+        safe_record(common, "torch", args.csv, accuracy=acc_t, ms=ms_t, fps=fps_t, timed_images=n_imgs_t)
+        print(f"Torch: acc={acc_t:.4f} | {ms_t:.3f} ms/img | FPS={fps_t:.2f}")
+    except Exception as e:
+        safe_record(common, "torch", args.csv, error_msg=f"{type(e).__name__}: {e}")
+        print(f"[ERR] Torch failed: {type(e).__name__}: {e}")
 
-    print("---- RESULTS ----")
-    print(f"Torch:          acc={acc_t:.4f} | {ms_t:.3f} ms/img | FPS={fps_t:.2f} | timed_imgs={n_imgs_t}")
-    print(f"ONNXRuntime:    acc={acc_o:.4f} | {ms_o:.3f} ms/img | FPS={fps_o:.2f} | timed_imgs={n_imgs_o}")
-    print(f"TensorRT eng.:  acc={acc_e:.4f} | {ms_e:.3f} ms/img | FPS={fps_e:.2f} | timed_imgs={n_imgs_e}")
-    print(f"[OK] Appended CSV: {os.path.abspath(args.csv)}")
+    # ORT
+    if args.skip_onnx:
+        safe_record(common, "onnxruntime", args.csv, error_msg="SKIPPED")
+    else:
+        import onnxruntime as ort
+        if args.ort_provider == "cpu":
+            providers = ["CPUExecutionProvider"]
+        elif args.ort_provider == "cuda":
+            providers = [("CUDAExecutionProvider", {"device_id": 0})]
+        else:
+            providers = [("CUDAExecutionProvider", {"device_id": 0}), "CPUExecutionProvider"]
+        try:
+            sess = ort.InferenceSession(args.onnx, providers=providers)
+            used = sess.get_providers()
+            acc_o, t_sum_o, n_imgs_o = eval_onnx(sess, loader, args.warmup_batches, max_batches, args.device)
+            ms_o, fps_o = ms_per_img_and_fps(t_sum_o, n_imgs_o)
+            safe_record(common, "onnxruntime_" + ("cuda" if "CUDAExecutionProvider" in used else "cpu"),
+                        args.csv, accuracy=acc_o, ms=ms_o, fps=fps_o, timed_images=n_imgs_o)
+            print(f"ORT({used[0]}): acc={acc_o:.4f} | {ms_o:.3f} ms/img | FPS={fps_o:.2f}")
+        except Exception as e:
+            safe_record(common, "onnxruntime", args.csv, error_msg=f"{type(e).__name__}: {e}")
+            print(f"[ERR] ORT failed: {type(e).__name__}: {e}")
+
+    # TRT
+    if args.skip_trt:
+        safe_record(common, "tensorrt_engine", args.csv, error_msg="SKIPPED")
+    else:
+        try:
+            acc_e, t_sum_e, n_imgs_e = eval_trt(args.engine, loader, args.warmup_batches, max_batches, args.device)
+            ms_e, fps_e = ms_per_img_and_fps(t_sum_e, n_imgs_e)
+            safe_record(common, "tensorrt_engine", args.csv, accuracy=acc_e, ms=ms_e, fps=fps_e, timed_images=n_imgs_e)
+            print(f"TRT: acc={acc_e:.4f} | {ms_e:.3f} ms/img | FPS={fps_e:.2f}")
+        except Exception as e:
+            safe_record(common, "tensorrt_engine", args.csv, error_msg=f"{type(e).__name__}: {e}")
+            print(f"[ERR] TRT failed: {type(e).__name__}: {e}")
+
+    print(f"[OK] CSV appended: {os.path.abspath(args.csv)}")
+
 
 if __name__ == "__main__":
     main()
