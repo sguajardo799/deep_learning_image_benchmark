@@ -11,7 +11,7 @@ paths:
   summary_path: ./data/training_summary.json
 
 train:
-  batch_size: 8
-  epochs: 2
+  batch_size: 16
+  epochs: 3
   patience: 1
   lr: 0.001
